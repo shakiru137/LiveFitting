@@ -1,0 +1,109 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Partner / Tenant ──────────────────────────────────────────────────────────
+// A "Partner" is any company that integrates LiveFittingRoom into their product
+// (e.g. SewMyWears). Each partner has a unique clientId and a hashed secret key.
+model Partner {
+  id              String    @id @default(cuid())
+  clientId        String    @unique
+  name            String
+  secretKeyHash   String    // bcrypt-hashed API secret — never store plain text
+  allowedOrigins  String[]  // e.g. ["https://sewmywears.com", "https://app.sewmywears.com"]
+  isActive        Boolean   @default(true)
+  webhookUrl      String?   // Optional: POST measurement result to partner after completion
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  sessions        Session[]
+}
+
+// ─── Measurement Session ────────────────────────────────────────────────────────
+// Created when a user starts the LiveFittingRoom flow.
+// The sessionRef is the publicly sharable identifier (partners/customers see this).
+// The internal id (cuid) is never exposed externally.
+model Session {
+  id            String    @id @default(cuid())
+  sessionRef    String    @unique
+  clientId      String
+  customerId    String?   // Partner's own customer ID — opaque to Digitcan
+  status        SessionStatus @default(PENDING)
+  userAgent     String?
+  ipAddress     String?
+  metadata      Json?     // Optional extra context from partner (e.g. garment type, use-case)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  completedAt   DateTime?
+  expiresAt     DateTime  // Sessions expire after 2 hours if not completed
+
+  partner       Partner   @relation(fields: [clientId], references: [clientId])
+  measurements  Measurement[]
+}
+
+enum SessionStatus {
+  PENDING       // Created, not yet started
+  ACTIVE        // Camera open, in progress
+  MEASURING     // Body detected, calculating
+  COMPLETE      // Measurements finalized
+  FAILED        // Error during measurement
+  EXPIRED       // Timed out
+}
+
+// ─── Measurement Result ─────────────────────────────────────────────────────────
+// All measurements for a completed session.
+// Values stored in cm; inch conversion done on-demand.
+// confidence is a 0.0–1.0 score indicating overall measurement reliability.
+model Measurement {
+  id                    String    @id @default(cuid())
+  sessionId             String
+  engineVersion         String    // e.g. "1.0.0" — allows future algorithm versioning
+
+  // Core body measurements in cm
+  heightCm              Float?
+  headCircumferenceCm   Float?
+  neckCircumferenceCm   Float?
+  shoulderWidthCm       Float?
+  chestGirthCm          Float?
+  waistGirthCm          Float?
+  hipGirthCm            Float?
+  torsoLengthCm         Float?
+  sleeveLengthCm        Float?
+  trouserLengthCm       Float?
+  skirtLengthCm         Float?
+
+  // Suggested sizing
+  suggestedSize         String?   // e.g. "UK 10 (M)"
+
+  // Quality / confidence metadata
+  overallConfidence     Float?    // 0.0 – 1.0
+  stabilityScore        Float?    // 0.0 – 1.0 variance measure
+  framesAnalyzed        Int?
+  qualityGrade          String?   // "good" | "fair" | "poor"
+
+  // Internal Digitcan Operational Telemetry (Private to Digitcan)
+  isSaved               Boolean   @default(false)
+  isCopied              Boolean   @default(false)
+  copiedAt              DateTime?
+  startedAt             DateTime?
+  processingDurationMs  Int?
+  retryCount            Int       @default(0)
+  validationStatus      String?   @default("VALIDATED")
+
+  // Raw engine output (private — for debugging/audit only, never returned to partners)
+  rawData               Json?
+
+  capturedAt            DateTime  @default(now())
+
+  session               Session   @relation(fields: [sessionId], references: [id])
+
+  @@index([sessionId])
+}
