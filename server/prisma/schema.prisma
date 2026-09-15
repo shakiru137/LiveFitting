@@ -45,8 +45,21 @@ model Session {
   completedAt   DateTime?
   expiresAt     DateTime  // Sessions expire after 2 hours if not completed
 
+  // Provenance / timing fields
+  cameraRequestedAt    DateTime?
+  cameraGrantedAt      DateTime?
+  firstBodyDetectedAt  DateTime?
+  firstValidPoseAt     DateTime?
+  measurementStartedAt DateTime?
+  measurementCompletedAt DateTime?
+  resultsDisplayedAt   DateTime?
+
   partner       Partner   @relation(fields: [clientId], references: [clientId])
   measurements  Measurement[]
+  events        SessionEvent[]
+  deviceContext DeviceContext?
+
+  @@index([clientId])
 }
 
 enum SessionStatus {
@@ -101,9 +114,44 @@ model Measurement {
   // Raw engine output (private — for debugging/audit only, never returned to partners)
   rawData               Json?
 
+  // provenance stats (min/max/mean/median/variance stored as JSON for flexibility)
+  provenance            Json?
+
   capturedAt            DateTime  @default(now())
 
   session               Session   @relation(fields: [sessionId], references: [id])
 
   @@index([sessionId])
+}
+
+// ─── Session Events (structured telemetry) ──────────────────────────────────────
+model SessionEvent {
+  id         String   @id @default(cuid())
+  sessionId  String
+  type       String
+  payload    Json?
+  createdAt  DateTime @default(now())
+
+  session    Session  @relation(fields: [sessionId], references: [id])
+
+  @@index([sessionId, type])
+}
+
+// ─── Device / Browser Context captured at session creation ─────────────────────
+model DeviceContext {
+  id                String   @id @default(cuid())
+  sessionId         String   @unique
+  deviceClass       String?
+  browser           String?
+  browserVersion    String?
+  os                String?
+  screenWidth       Int?
+  screenHeight      Int?
+  devicePixelRatio  Float?
+  cameraResolutionW Int?
+  cameraResolutionH Int?
+  facingMode        String?
+  createdAt         DateTime @default(now())
+
+  session           Session  @relation(fields: [sessionId], references: [id])
 }
