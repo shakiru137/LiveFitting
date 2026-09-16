@@ -1,40 +1,19 @@
-/**
- * measurementEngine.ts
- *
- * Core body measurement calculation engine.
- *
- * Design principles:
- * 1. STABILITY GATE — measurements are only finalised after 60 consecutive stable frames.
- *    A frame is "stable" when the coefficient of variation for each measurement is < 3%.
- *
- * 2. HEIGHT CALIBRATION — the user enters their height, which anchors the pixel→cm scale.
- *    If full body (nose→ankle) is visible, we use that distance. Otherwise we fall back
- *    to the torso proportion (torso = ~28.5% of height).
- *
- * 3. CIRCUMFERENCE ESTIMATION — we only see the front of the body. Girth measurements are
- *    derived from front-facing width using validated anthropometric depth ratios:
- *      bust:      depth ≈ 0.72 × front_width → circ_factor ≈ 2.20
- *      waist:     depth ≈ 0.65 × front_width → circ_factor ≈ 2.10
- *      hips:      depth ≈ 0.78 × front_width → circ_factor ≈ 2.26
- *      neck:      estimated from head width proportion
- *      head:      bi-auricular width × 3.64 (validated anthropometric ratio)
- *
- * 4. OUTLIER REJECTION — each frame, values > 2.5σ from the running mean are discarded.
- *
- * 5. NEVER FAKE ACCURACY — if insufficient landmarks are visible, return null rather than
- *    a made-up number. The UI will indicate which measurements are unavailable.
- */
+/*
+  measurementEngine.ts
+  (modified to include provenance building and confidence filtering)
+*/
 
 import type { RawLandmark, MeasurementsCm, MeasurementQuality, QualityGrade } from '../types';
 import { projectLandmarkToContainer } from './useBodyTracking';
 
-// ─── Constants ─────────────────────────────────────────────────────────────────
+// ─── Constants ─────────────────────────────────────────────────────────��[...]
 
 const STABILITY_FRAMES = 60;      // Frames required before finalising
 const STABILITY_MAX_CV = 0.03;    // 3% coefficient of variation = stable
 const OUTLIER_SIGMA = 2.5;
 
 export const ENGINE_VERSION = '1.0.0';
+const MIN_FRAME_CONFIDENCE = 0.35; // Frames below this confidence are ignored for provenance
 
 // MediaPipe Indices
 const IDX = {
@@ -47,7 +26,7 @@ const IDX = {
   LEFT_ANKLE: 27,    RIGHT_ANKLE: 28,
 } as const;
 
-// ─── Geometry helpers ──────────────────────────────────────────────────────────
+// ─── Geometry helpers ───────────────────────────────────────────────────────�[...]
 function dist(a: { x: number; y: number }, b: { x: number; y: number }): number {
   return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2);
 }
@@ -63,7 +42,7 @@ const CIRC = {
   neck:   3.14,  // Approximate π (roughly cylindrical)
 };
 
-// ─── Statistical helpers ────────────────────────────────────────────────────────
+// ─── Statistical helpers ──────────────────────────────────────────────────────�[...]
 function mean(arr: number[]): number {
   return arr.reduce((s, v) => s + v, 0) / arr.length;
 }
@@ -84,7 +63,7 @@ function filteredMean(arr: number[]): number {
   return filtered.length > 0 ? mean(filtered) : m;
 }
 
-// ─── Frame Buffer ──────────────────────────────────────────────────────────────
+// ─── Frame Buffer ────────────────────────────────────────────────────────��[...]
 // Accumulates raw measurements per frame for stability analysis
 type FrameKey = keyof MeasurementsCm;
 const TRACKED_KEYS: FrameKey[] = [
@@ -182,7 +161,7 @@ export function computeFrameMeasurement(
   const confidence = (shoulderVis + hipVis + (ankleVis > 0 ? ankleVis : 0.3)) / 3;
   const values: Partial<Record<FrameKey, number>> = {};
 
-  // ── 1. Height ──────────────────────────────────────────────────────────────
+  // ── 1. Height ─────────────────────────────────────────────────────────��[...]
   if (ankleVis > 0.35) {
     values.height = dist(nose, ankleMid) * 1.15 * scaleCmPerPx;
   }
@@ -197,44 +176,36 @@ export function computeFrameMeasurement(
   }
 
   // ── 3. Neck Circumference ──────────────────────────────────────────────────
-  // Estimated: neck width ≈ 60% of bi-auricular head width.
-  // Neck is roughly cylindrical (depth ≈ width), so circ ≈ neck_width × π.
-  // Additional 1.08 factor from anatomical studies (neck is slightly oval, deeper than wide).
   if (values.headCircumference) {
     const headWidthCm = values.headCircumference / 3.64;
     const neckWidthCm = headWidthCm * 0.60;
     values.neckCircumference = neckWidthCm * CIRC.neck * 1.08;
   } else if (shoulderVis > 0.5) {
-    // Fallback: estimate neck from shoulder width (neck ≈ 22% of shoulder width)
     const shoulderPx = dist(lShoulder, rShoulder);
     const neckWidthCm = shoulderPx * scaleCmPerPx * 0.22;
     values.neckCircumference = neckWidthCm * CIRC.neck;
   }
 
   // ── 4. Shoulder Width ──────────────────────────────────────────────────────
-  // Direct biacromial measurement — no circumference conversion needed
   values.shoulderWidth = dist(lShoulder, rShoulder) * scaleCmPerPx;
 
-  // ── 5. Chest Girth ─────────────────────────────────────────────────────────
-  // Bust point ≈ 22% down from shoulder to hip
+  // ── 5. Chest Girth ────────────────────────────────────────────────────────
   const bustLeft  = lerp(lShoulder, lHip, 0.22);
   const bustRight = lerp(rShoulder, rHip, 0.22);
   const bustWidthCm = dist(bustLeft, bustRight) * scaleCmPerPx;
   values.chestGirth = bustWidthCm * CIRC.chest;
 
-  // ── 6. Waist Girth ─────────────────────────────────────────────────────────
-  // Waist point ≈ 63% down from shoulder to hip
+  // ── 6. Waist Girth ────────────────────────────────────────────────────────
   const waistLeft  = lerp(lShoulder, lHip, 0.63);
   const waistRight = lerp(rShoulder, rHip, 0.63);
   const waistWidthCm = dist(waistLeft, waistRight) * scaleCmPerPx;
   values.waistGirth = waistWidthCm * CIRC.waist;
 
-  // ── 7. Hip Girth ───────────────────────────────────────────────────────────
+  // ── 7. Hip Girth ─────────────────────────────────────────────────────────
   const hipWidthCm = dist(lHip, rHip) * scaleCmPerPx;
   values.hipGirth = hipWidthCm * CIRC.hips;
 
-  // ── 8. Torso Length ────────────────────────────────────────────────────────
-  // Shoulder mid to hip mid — scaled by 0.92 to account for slight forward lean in 2D projection
+  // ── 8. Torso Length ───────────────────────────────────────────────────────
   values.torsoLength = dist(shoulderMid, hipMid) * scaleCmPerPx * 0.92;
 
   // ── 9. Sleeve / Arm Length ────────────────────────────────────────────────
@@ -261,6 +232,9 @@ export function computeFrameMeasurement(
 
 // ─── Append frame to buffer ────────────────────────────────────────────────────
 export function appendFrame(buf: FrameBuffer, frame: RawFrameMeasurement): void {
+  // Skip low-confidence frames entirely — they do not contribute to stability/provenance
+  if (frame.confidence < MIN_FRAME_CONFIDENCE) return;
+
   for (const key of TRACKED_KEYS) {
     const v = frame.values[key];
     if (v != null && isFinite(v) && v > 0) {
@@ -284,13 +258,6 @@ export interface QualityEvaluation {
   canAutoCapture: boolean;
 }
 
-/**
- * Evaluates the quality and stability score of the current frame buffer.
- * High quality requires:
- * - Minimum 60 frames collected under good positioning
- * - Low coefficient of variation (CV < 2.5%) across shoulder, chest, waist, hip metrics
- * - High landmark confidence and full-body visibility
- */
 export function evaluateBufferQuality(buf: FrameBuffer): QualityEvaluation {
   const essentialKeys: FrameKey[] = ['shoulderWidth', 'chestGirth', 'waistGirth', 'hipGirth'];
   let totalCv = 0;
@@ -344,14 +311,10 @@ export function evaluateBufferQuality(buf: FrameBuffer): QualityEvaluation {
   };
 }
 
-/**
- * Legacy compatibility alias
- */
 export function isStable(buf: FrameBuffer): boolean {
   return evaluateBufferQuality(buf).canAutoCapture;
 }
 
-/** Returns 0–1 progress towards auto-capture condition */
 export function stabilityProgress(buf: FrameBuffer): number {
   const evalResult = evaluateBufferQuality(buf);
   const minFrames = evalResult.framesAnalyzed;
@@ -359,11 +322,6 @@ export function stabilityProgress(buf: FrameBuffer): number {
   return Math.min(1, (frameProg + evalResult.stabilityScore) / 2);
 }
 
-// ─── Finalise Measurements (Best Window Selection) ─────────────────────────────
-/**
- * Computes final measurements from the optimal stable window in the frame buffer.
- * Outliers (> 2.5σ) are filtered out to extract canonical body metrics.
- */
 export function finaliseMeasurements(
   buf: FrameBuffer,
   userHeightCm: number
@@ -419,6 +377,45 @@ export function finaliseMeasurements(
 }
 
 /**
+ * Build provenance information for measurements computed from the buffer.
+ * Produces per-key statistics (framesAnalyzed, framesUsed, min, max, mean, median, variance, outlierCount)
+ */
+export function buildProvenance(buf: FrameBuffer) {
+  const statsFor = (arr: number[] | undefined) => {
+    if (!arr || arr.length === 0) return null;
+    const n = arr.length;
+    const meanVal = arr.reduce((a, b) => a + b, 0) / n;
+    const sorted = [...arr].sort((a, b) => a - b);
+    const median = n % 2 === 1 ? sorted[(n - 1) / 2] : (sorted[n / 2 - 1] + sorted[n / 2]) / 2;
+    const variance = arr.reduce((a, b) => a + Math.pow(b - meanVal, 2), 0) / n;
+    const min = sorted[0];
+    const max = sorted[n - 1];
+    const outlierThresholdHigh = meanVal + 2.5 * Math.sqrt(variance);
+    const outlierThresholdLow = meanVal - 2.5 * Math.sqrt(variance);
+    const outlierCount = arr.filter((v) => v > outlierThresholdHigh || v < outlierThresholdLow).length;
+    return { framesAnalyzed: n, framesUsed: n, min, max, mean: Math.round(meanVal * 10) / 10, median: Math.round(median * 10) / 10, variance: Math.round(variance * 100) / 100, outlierCount };
+  };
+
+  const keys: FrameKey[] = ['height','headCircumference','neckCircumference','shoulderWidth','chestGirth','waistGirth','hipGirth','torsoLength','sleeveLength','trouserLength','skirtLength'];
+  const result: Record<string, unknown> = { engineVersion: ENGINE_VERSION } as any;
+  keys.forEach((k) => {
+    const arr = buf.get(k) as number[] | undefined;
+    result[k] = statsFor(arr as number[] | undefined);
+  });
+
+  // Overall stats
+  const evalResult = evaluateBufferQuality(buf);
+  const overall: any = {
+    framesAnalyzed: evalResult.framesAnalyzed,
+    stabilityScore: evalResult.stabilityScore,
+    confidence: evalResult.confidence,
+  };
+  result.overall = overall;
+
+  return result;
+}
+
+/**
  * Builds client-side MeasurementResult object directly from engine frame buffer
  */
 export function buildLocalMeasurementResult(
@@ -447,6 +444,8 @@ export function buildLocalMeasurementResult(
     skirtLength: mapIn(measurements.skirtLength),
   };
 
+  const provenance = buildProvenance(buf);
+
   return {
     sessionRef: sessionRef ?? `LOCAL-${Math.random().toString(36).slice(2, 8).toUpperCase()}`,
     clientId: clientId ?? 'digitcan',
@@ -460,5 +459,6 @@ export function buildLocalMeasurementResult(
     suggestedSize,
     quality,
     userHeightCm,
+    provenance,
   };
 }

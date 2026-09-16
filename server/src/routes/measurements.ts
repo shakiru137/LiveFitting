@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { z } from 'zod';
 import { prisma } from '../db';
 import { config } from '../config';
+import { requirePartnerKey } from '../middleware/partnerAuth';
 
 const router = Router();
 
@@ -26,7 +27,9 @@ const MeasurementSchema = z.object({
 });
 
 // ─── POST /api/sessions/:ref/measurements ─────────────────────────────────────
-router.post('/:ref/measurements', async (req: Request, res: Response): Promise<void> => {
+// Accepts measurement results from browser-origin flows (CORS) or server-to-server calls
+// (requires X-Partner-Key / Bearer). When partner key is provided, tenant isolation is enforced.
+router.post('/:ref/measurements', requirePartnerKey, async (req: Request, res: Response): Promise<void> => {
   const refStr = Array.isArray(req.params.ref) ? req.params.ref[0] : req.params.ref;
   const session = await prisma.session.findUnique({
     where: { sessionRef: refStr },
@@ -45,6 +48,14 @@ router.post('/:ref/measurements', async (req: Request, res: Response): Promise<v
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const rawDataPayload: any = req.body.rawData ?? null;
 
+  // Enforce tenant isolation: if partner middleware attached req.partner, ensure session belongs to that partner
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const reqAny = req as any;
+  if (reqAny.partner && reqAny.partner.clientId && reqAny.partner.clientId !== session.clientId) {
+    res.status(403).json({ error: 'Partner mismatch for session' });
+    return;
+  }
+
   const [measurement] = await prisma.$transaction([
     prisma.measurement.create({
       data: {
@@ -61,23 +72,36 @@ router.post('/:ref/measurements', async (req: Request, res: Response): Promise<v
     }),
   ]);
 
-  // Clean Partner Payload (e.g. for SewMyWears) — excludes internal telemetry
+  // Clean Partner Payload (excludes internal telemetry)
   const partnerPayload = buildCleanPartnerPayload(measurement);
 
   // Digitcan Internal Record — complete telemetry for analytics
   const internalRecord = buildDigitcanInternalRecord(session, measurement);
 
+  // Fire partner webhook (best-effort)
   firePartnerWebhook(session.clientId, partnerPayload).catch(() => { /* silent */ });
 
-  res.status(201).json({
-    result: partnerPayload,
-    internalRecord, // Internal audit reference
-  });
+  // Persist internalRecord as a SessionEvent for internal analytics/audit — DO NOT return it to partners
+  try {
+    await prisma.sessionEvent.create({
+      data: {
+        sessionId: session.id,
+        type: 'measurement.saved',
+        payload: internalRecord as any,
+      },
+    });
+  } catch (err) {
+    console.error('[Measurements] Failed to persist internal session event:', err);
+  }
+
+  // Return only the sanitized partner payload
+  res.status(201).json({ result: partnerPayload });
 });
 
 // ─── POST /api/sessions/:ref/telemetry ─────────────────────────────────────────
 // Internal Digitcan operational & analytics telemetry endpoint
 router.post('/:ref/telemetry', async (req: Request, res: Response): Promise<void> => {
+  // For backward compatibility we allow telemetry here but prefer the dedicated telemetry router
   const refStr = Array.isArray(req.params.ref) ? req.params.ref[0] : req.params.ref;
   const { event } = req.body;
 
@@ -120,7 +144,7 @@ router.get('/:ref/measurements', async (req: Request, res: Response): Promise<vo
   res.json({ result: buildCleanPartnerPayload(session.measurements[0]) });
 });
 
-// ─── Helpers ───────────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────[...]
 
 /**
  * Builds clean client/partner payload containing ONLY requested measurements and unit.

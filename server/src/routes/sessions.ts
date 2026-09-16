@@ -17,7 +17,7 @@ function extractParam(val: string | string[] | undefined): string | undefined {
   return val;
 }
 
-// ─── POST /api/sessions ────────────────────────────────────────────────────────
+// ─── POST /api/sessions ──────────────────────────────────────────────────────
 router.post('/', async (req: Request, res: Response): Promise<void> => {
   const body = {
     clientId:   extractParam(req.body.clientId   ?? req.query.clientId),
@@ -38,19 +38,21 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
     where: { clientId: externalClientId },
   });
 
-  // Auto-provision demo partners if they don't exist yet (for demo/testing fallback)
-  if (!partner && ['demo-client', 'digitcan', 'sewmywears'].includes(externalClientId.toLowerCase())) {
+  // Auto-provision demo partners if they don't exist yet (DEV ONLY)
+  if (!partner && config.isDev && ['demo-client', 'digitcan', 'sewmywears'].includes(externalClientId.toLowerCase())) {
     partner = await prisma.partner.upsert({
       where: { clientId: externalClientId },
       create: {
         clientId: externalClientId,
         name: `${externalClientId} Partner`,
+        // demo-only placeholder secret — overwritten by seed when appropriate
         secretKeyHash: '$2b$12$e0MYzXy.Xk5.demoDummySecretHashForAutoCreatedPartners',
-        allowedOrigins: ['*'],
+        allowedOrigins: config.devAllowedOrigins,
         isActive: true,
       },
       update: { isActive: true },
     });
+    console.log(`[SessionCreate] Auto-provisioned demo partner for clientId=${externalClientId} (dev-only)`);
   }
 
   // 2. Verify Partner is active
@@ -59,8 +61,8 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
     return;
   }
 
-  // Safe logging requested for verification
-  console.log(`[SessionCreate] received external clientId: "${externalClientId}", resolved Partner.id: "${partner.id}", resolved Partner.clientId: "${partner.clientId}"`);
+  // Safe logging requested for verification (avoid logging secrets)
+  console.log(`[SessionCreate] received external clientId: "${externalClientId}", resolved Partner.clientId: "${partner.clientId}"`);
 
   const expiresAt = new Date(Date.now() + config.sessionTtlHours * 60 * 60 * 1000);
   const sessionRef = generateSessionRef();
@@ -73,7 +75,7 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
   const session = await prisma.session.create({
     data: {
       sessionRef,
-      clientId: partner.clientId, // Partner.clientId required by schema relation (references: [clientId])
+      clientId: partner.clientId,
       customerId: customerId ?? null,
       status: 'PENDING',
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -82,10 +84,27 @@ router.post('/', async (req: Request, res: Response): Promise<void> => {
       ipAddress,
       expiresAt,
     },
-    select: { sessionRef: true, status: true, createdAt: true, expiresAt: true },
+    select: { id: true, sessionRef: true, status: true, createdAt: true, expiresAt: true },
   });
 
-  // 4. Return external clientId ("demo-client") in response contract
+  // Persist session_created event for telemetry/audit
+  try {
+    await prisma.sessionEvent.create({
+      data: {
+        sessionId: session.id,
+        type: 'session.created',
+        payload: {
+          clientId: partner.clientId,
+          customerId: customerId ?? null,
+          metadata: metadata ?? {},
+        },
+      },
+    });
+  } catch (err) {
+    console.error('[SessionCreate] Failed to persist session event:', err);
+  }
+
+  // 4. Return external clientId in response contract
   res.status(201).json({
     session: {
       sessionRef: session.sessionRef,
@@ -147,11 +166,30 @@ router.patch('/:ref/status', async (req: Request, res: Response): Promise<void> 
   const session = await prisma.session.findUnique({ where: { sessionRef: refStr } });
   if (!session) { res.status(404).json({ error: 'Session not found' }); return; }
 
+  const updates: Record<string, unknown> = { status: status as S };
+  if (status === 'COMPLETE') updates.completedAt = new Date();
+  if (status === 'ACTIVE') updates['cameraGrantedAt'] = new Date();
+  if (status === 'MEASURING') updates['measurementStartedAt'] = new Date();
+  if (status === 'FAILED') updates['completedAt'] = new Date();
+
   const updated = await prisma.session.update({
     where: { sessionRef: refStr },
-    data: { status: status as S, completedAt: status === 'COMPLETE' ? new Date() : undefined },
+    data: updates,
     select: { sessionRef: true, status: true, updatedAt: true },
   });
+
+  // Persist status change event
+  try {
+    await prisma.sessionEvent.create({
+      data: {
+        sessionId: session.id,
+        type: 'session.status_changed',
+        payload: { status: updated.status },
+      },
+    });
+  } catch (err) {
+    console.error('[SessionStatus] Failed to persist session status event:', err);
+  }
 
   res.json({ session: updated });
 });
